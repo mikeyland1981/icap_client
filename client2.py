@@ -5,14 +5,16 @@ import sys
 import os
 import argparse
 import time
-from typing import Optional, Tuple
+import select
+from typing import Optional, Tuple, Dict, Any
+import binascii
 
 
 class IcapClient:
     """
     Client for communicating with ICAP servers over SSL/TLS to scan files.
     """
-    def __init__(self, server: str, port: int = 1344, user_agent: str = "SCSOPS ICAP Client/1.1"):
+    def __init__(self, server: str, port: int = 1344, user_agent: str = "SCSOPS ICAP Client/1.1", debug: bool = False):
         """
         Initialize ICAP client with server details.
         
@@ -20,208 +22,477 @@ class IcapClient:
             server: ICAP server hostname or IP
             port: ICAP server port (default: 1344)
             user_agent: User agent string to identify client
+            debug: Enable verbose debug output
         """
         self.server = server
         self.port = port
         self.user_agent = user_agent
+        self.debug = debug
         
-    def scan_file(self, filename: str, timeout: int = 300, read_timeout: int = 30) -> Optional[str]:
+    def log(self, message: str, level: str = "INFO") -> None:
+        """Log a message if debugging is enabled."""
+        if self.debug or level == "ERROR":
+            print(f"[{level}] {message}")
+        
+    def scan_file(self, filename: str, service_path: str = "virus_scan", 
+                  timeout: int = 300, read_timeout: int = 60) -> Dict[str, Any]:
         """
         Send a file to the ICAP server for scanning.
         
         Args:
             filename: Path to the file to be scanned
+            service_path: ICAP service path
             timeout: Connection timeout in seconds
             read_timeout: Timeout for reading response chunks
             
         Returns:
-            Server response as string or None if error occurred
+            Dictionary containing response details and status
         """
+        result = {
+            "success": False,
+            "raw_response": None,
+            "status_code": None,
+            "status_text": None,
+            "headers": {},
+            "error": None,
+            "scan_result": "UNKNOWN"
+        }
+        
         # Create socket and wrap with SSL
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         context = ssl.create_default_context()
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE  # WARNING: In production, use proper certificate verification
         
-        conn = context.wrap_socket(sock=s)
-        
+        conn = None
         try:
-            print(f"Connecting to {self.server}:{self.port}...")
+            conn = context.wrap_socket(sock=s)
+            self.log(f"Connecting to {self.server}:{self.port}...")
             conn.settimeout(timeout)
             conn.connect((self.server, self.port))
-            print("Connected. Sending file...")
+            self.log("Connected successfully")
             
-            response = self._handle_request(conn, filename, read_timeout)
-            return response
+            # Send OPTIONS request first to check server capabilities
+            if self._send_options_request(conn):
+                self.log("Server responded to OPTIONS request, proceeding with file scan")
+            else:
+                self.log("Server did not respond to OPTIONS request, proceeding anyway", "WARNING")
             
+            response_data = self._send_scan_request(conn, filename, service_path, read_timeout)
+            
+            if response_data:
+                result["raw_response"] = response_data
+                parsed = self._parse_icap_response(response_data)
+                
+                # Update result with parsed information
+                result.update(parsed)
+                result["success"] = True
+            else:
+                result["error"] = "No response received from server"
+                
         except socket.timeout:
-            print("Error: Connection timed out")
+            result["error"] = f"Connection timed out when connecting to {self.server}:{self.port}"
+            self.log(result["error"], "ERROR")
         except ConnectionRefusedError:
-            print(f"Error: Connection refused by {self.server}:{self.port}")
+            result["error"] = f"Connection refused by {self.server}:{self.port}"
+            self.log(result["error"], "ERROR")
         except Exception as e:
-            print(f"Error: {str(e)}")
+            result["error"] = f"Error: {str(e)}"
+            self.log(result["error"], "ERROR")
+            if self.debug:
+                import traceback
+                traceback.print_exc()
         finally:
-            conn.close()
+            if conn:
+                conn.close()
+                
+        return result
             
-        return None
-        
-    def _handle_request(self, conn: ssl.SSLSocket, filename: str, read_timeout: int) -> str:
+    def _send_options_request(self, conn: ssl.SSLSocket) -> bool:
         """
-        Build and send the ICAP request, then process the response.
+        Send an OPTIONS request to the ICAP server to check if it's responsive.
+        
+        Args:
+            conn: Active SSL socket connection
+            
+        Returns:
+            True if server responded properly, False otherwise
+        """
+        try:
+            options_request = (
+                f"OPTIONS icap://{self.server}/virus_scan ICAP/1.0\r\n"
+                f"Host: {self.server}\r\n"
+                f"User-Agent: {self.user_agent}\r\n"
+                f"\r\n"
+            )
+            
+            conn.settimeout(10)  # Short timeout for OPTIONS
+            conn.sendall(options_request.encode('utf-8'))
+            
+            # Just try to get some response
+            response = conn.recv(1024)
+            return b"ICAP/1.0" in response
+        except Exception as e:
+            self.log(f"OPTIONS request failed: {str(e)}", "WARNING")
+            return False
+            
+    def _send_scan_request(self, conn: ssl.SSLSocket, filename: str, 
+                           service_path: str, read_timeout: int) -> Optional[bytes]:
+        """
+        Build and send the ICAP file scan request, then read the response.
         
         Args:
             conn: Active SSL socket connection
             filename: Path to file to send
-            read_timeout: Timeout for reading response chunks
+            service_path: ICAP service path
+            read_timeout: Timeout for reading response
             
         Returns:
-            Server response as string
+            Raw response bytes or None if error occurred
         """
         # Read file content
         with open(filename, 'rb') as f:
             file_data = f.read()
         
         file_size = len(file_data)
-        print(f"File size: {file_size} bytes")
+        self.log(f"File size: {file_size} bytes")
+        
+        # Try several ways of formatting the request to handle different server implementations
+        try:
+            # Standard format with Content-Length method
+            payload = self._create_standard_payload(filename, file_data, service_path)
+            
+            # Send the request
+            self.log("Sending file scan request...")
+            conn.settimeout(30)  # Timeout for sending data
+            conn.sendall(payload)
+            self.log("Request sent, waiting for response...")
+            
+            # Improved response reading
+            response_data = self._read_response_with_timeout(conn, read_timeout)
+            
+            # If we got no valid response, try alternative format
+            if not response_data or len(response_data) < 10:
+                self.log("No valid response received, trying alternative request format...", "WARNING")
+                # Try chunked encoding approach
+                payload = self._create_chunked_payload(filename, file_data, service_path)
+                conn.sendall(payload)
+                response_data = self._read_response_with_timeout(conn, read_timeout)
+            
+            return response_data
+            
+        except Exception as e:
+            self.log(f"Error sending scan request: {str(e)}", "ERROR")
+            if self.debug:
+                import traceback
+                traceback.print_exc()
+            return None
+    
+    def _create_standard_payload(self, filename: str, file_data: bytes, service_path: str) -> bytes:
+        """Create standard ICAP request payload with Content-Length."""
+        # Base filename without path
+        base_filename = os.path.basename(filename)
         
         # Construct HTTP headers for the encapsulated request
         http_headers = (
             f"POST / HTTP/1.1\r\n"
             f"Host: {self.server}\r\n"
             f"Content-Type: application/octet-stream\r\n"
-            f"Content-Length: {file_size}\r\n"
+            f"Content-Disposition: attachment; filename=\"{base_filename}\"\r\n"
+            f"Content-Length: {len(file_data)}\r\n"
             f"\r\n"
-        )
+        ).encode('utf-8')
         
         # Construct ICAP headers
         icap_headers = (
-            f"REQMOD icap://{self.server}/virus_scan ICAP/1.0\r\n"
+            f"REQMOD icap://{self.server}/{service_path} ICAP/1.0\r\n"
             f"Host: {self.server}\r\n"
             f"User-Agent: {self.user_agent}\r\n"
             f"Allow: 204\r\n"
             f"Encapsulated: req-hdr=0, req-body={len(http_headers)}\r\n"
             f"\r\n"
-        )
+        ).encode('utf-8')
         
         # Combine everything into the full payload
-        payload = icap_headers.encode('utf-8') + http_headers.encode('utf-8') + file_data
+        payload = icap_headers + http_headers + file_data
         
-        # Send the request
-        conn.sendall(payload)
-        print("Request sent, waiting for response...")
+        if self.debug:
+            self.log(f"Request headers:\n{icap_headers.decode('utf-8', errors='replace')}")
+            
+        return payload
         
-        # Improved response reading with progressive timeouts
-        return self._read_response(conn, read_timeout)
-    
-    def _read_response(self, conn: ssl.SSLSocket, read_timeout: int) -> str:
+    def _create_chunked_payload(self, filename: str, file_data: bytes, service_path: str) -> bytes:
+        """Create alternative ICAP request payload with chunked encoding."""
+        # Base filename without path
+        base_filename = os.path.basename(filename)
+        
+        # Construct HTTP headers for the encapsulated request
+        http_headers = (
+            f"POST / HTTP/1.1\r\n"
+            f"Host: {self.server}\r\n"
+            f"Content-Type: application/octet-stream\r\n"
+            f"Content-Disposition: attachment; filename=\"{base_filename}\"\r\n"
+            f"Transfer-Encoding: chunked\r\n"
+            f"\r\n"
+        ).encode('utf-8')
+        
+        # Construct ICAP headers
+        icap_headers = (
+            f"REQMOD icap://{self.server}/{service_path} ICAP/1.0\r\n"
+            f"Host: {self.server}\r\n"
+            f"User-Agent: {self.user_agent}\r\n"
+            f"Allow: 204\r\n"
+            f"Encapsulated: req-hdr=0, req-body={len(http_headers)}\r\n"
+            f"\r\n"
+        ).encode('utf-8')
+        
+        # Format file data as chunked encoding
+        chunk_size = 8192  # 8KB chunks
+        chunked_data = b""
+        for i in range(0, len(file_data), chunk_size):
+            chunk = file_data[i:i+chunk_size]
+            chunk_header = f"{len(chunk):x}\r\n".encode('utf-8')
+            chunked_data += chunk_header + chunk + b"\r\n"
+        
+        # Add final zero-length chunk to end the body
+        chunked_data += b"0\r\n\r\n"
+        
+        # Combine everything into the full payload
+        payload = icap_headers + http_headers + chunked_data
+        
+        if self.debug:
+            self.log(f"Chunked request headers:\n{icap_headers.decode('utf-8', errors='replace')}")
+            
+        return payload
+
+    def _read_response_with_timeout(self, conn: ssl.SSLSocket, timeout: int) -> Optional[bytes]:
         """
-        Read the ICAP response with proper handling of chunked encoding.
+        Read the ICAP response with timeout.
         
         Args:
             conn: Active SSL socket connection
-            read_timeout: Timeout for reading response chunks
+            timeout: Total timeout for reading the response
             
         Returns:
-            Server response as string
+            Raw response bytes or None if error occurred
         """
-        # Set socket to non-blocking mode to avoid hanging
-        conn.setblocking(False)
+        conn.setblocking(0)  # Set to non-blocking mode
         
         response_data = b""
-        headers_complete = False
-        chunked_encoding = False
-        content_length = None
-        body_start = 0
         start_time = time.time()
+        end_time = start_time + timeout
         
-        while True:
-            # Check if we've been waiting too long
-            if time.time() - start_time > read_timeout:
-                print("Warning: Overall read timeout reached")
-                break
-                
-            # Try to read data with a short timeout
+        # If we don't get any data in the first 5 seconds, try again with a poke
+        first_data_received = False
+        
+        while time.time() < end_time:
+            # Check if data is available to read
             try:
-                ready_to_read = self._socket_wait_readable(conn, timeout=1.0)
-                if not ready_to_read:
-                    # No data available yet, but we haven't timed out completely
+                readable, _, _ = select.select([conn], [], [], 1.0)
+                
+                if not readable:
+                    # No data available yet
+                    elapsed = time.time() - start_time
+                    
+                    # If we've waited 5 seconds with no data, send a small poke
+                    if not first_data_received and elapsed > 5 and elapsed < 6:
+                        self.log("No initial response, sending a 'poke' request...", "WARNING")
+                        try:
+                            conn.sendall(b"\r\n")  # Send empty line as a poke
+                        except:
+                            pass  # Ignore if this fails
+                    
                     continue
                 
+                # Data is available, read it
                 chunk = conn.recv(8192)
+                
                 if not chunk:
                     # Connection closed by server
+                    self.log("Server closed connection")
                     break
-                    
+                
+                # We got some data
+                first_data_received = True
                 response_data += chunk
                 
-                # Reset the start time since we're actively receiving data
-                start_time = time.time()
+                # Show some of the response in debug mode
+                if self.debug and len(response_data) <= 1024:
+                    self.log(f"Response so far ({len(response_data)} bytes):\n" +
+                             response_data.decode('utf-8', errors='replace')[:200] + "...")
                 
-                # Process headers if we haven't done so yet
-                if not headers_complete:
-                    if b"\r\n\r\n" in response_data:
-                        headers_complete = True
-                        headers, body = response_data.split(b"\r\n\r\n", 1)
-                        headers_str = headers.decode('utf-8', errors='replace')
-                        
-                        # Check for chunked encoding
-                        if "Transfer-Encoding: chunked" in headers_str:
-                            chunked_encoding = True
-                        
-                        # Check for Content-Length
-                        for line in headers_str.split('\r\n'):
-                            if line.lower().startswith("content-length:"):
-                                try:
-                                    content_length = int(line.split(":", 1)[1].strip())
-                                except ValueError:
-                                    pass
-                        
-                        body_start = len(response_data) - len(body)
-                
-                # For non-chunked responses with Content-Length
-                if headers_complete and content_length is not None:
-                    if len(response_data) - body_start >= content_length:
-                        print("Response complete (content-length reached)")
-                        break
-                
-                # For chunked responses, check for the terminating chunk
-                if chunked_encoding and b"\r\n0\r\n\r\n" in response_data:
-                    print("Response complete (chunked encoding end marker found)")
+                # Look for end markers
+                if self._is_response_complete(response_data):
+                    self.log(f"Response complete ({len(response_data)} bytes)")
                     break
                     
             except ssl.SSLWantReadError:
                 # This is normal in non-blocking mode, just retry
                 continue
             except socket.error as e:
-                print(f"Socket error: {e}")
+                self.log(f"Socket error while reading: {e}", "ERROR")
                 break
         
-        # Use the more lenient 'replace' error handler for decoding
-        response = response_data.decode('utf-8', errors='replace')
-        
-        # Check if we have a valid ICAP response
-        if not response.startswith("ICAP"):
-            print("Warning: Response doesn't appear to be a valid ICAP response")
+        # Check if we hit the timeout
+        if time.time() >= end_time and not self._is_response_complete(response_data):
+            self.log(f"Read timeout after receiving {len(response_data)} bytes", "WARNING")
             
-        return response
-    
-    def _socket_wait_readable(self, sock, timeout=1.0) -> bool:
+            # If we got some data, try to make sense of it anyway
+            if len(response_data) == 0:
+                self.log("No data received from server", "ERROR")
+                return None
+        
+        return response_data
+        
+    def _is_response_complete(self, data: bytes) -> bool:
         """
-        Wait until socket is readable or timeout occurs.
+        Check if the response appears to be complete.
         
         Args:
-            sock: Socket to check
-            timeout: How long to wait in seconds
+            data: Current accumulated response data
             
         Returns:
-            True if socket is readable, False on timeout
+            True if response appears complete, False otherwise
         """
-        import select
+        # For standard HTTP/ICAP responses with Content-Length
+        if b"Content-Length:" in data and b"\r\n\r\n" in data:
+            headers, body = data.split(b"\r\n\r\n", 1)
+            headers_str = headers.decode('utf-8', errors='replace')
+            
+            for line in headers_str.split('\r\n'):
+                if line.lower().startswith("content-length:"):
+                    try:
+                        length = int(line.split(":", 1)[1].strip())
+                        return len(body) >= length
+                    except ValueError:
+                        pass
+        
+        # For chunked responses
+        if b"Transfer-Encoding: chunked" in data:
+            return b"\r\n0\r\n\r\n" in data
+            
+        # For ICAP responses with no encapsulated content
+        if b"ICAP/1.0" in data and b"\r\n\r\n" in data:
+            # Simple response with just headers
+            return True
+            
+        # If response is fairly large, assume it's complete
+        if len(data) > 1024:
+            return True
+            
+        return False
+
+    def _parse_icap_response(self, data: bytes) -> Dict[str, Any]:
+        """
+        Parse the ICAP response into structured format.
+        
+        Args:
+            data: Raw response data
+            
+        Returns:
+            Dictionary with parsed response details
+        """
+        result = {
+            "status_code": None,
+            "status_text": None,
+            "headers": {},
+            "scan_result": "UNKNOWN"
+        }
+        
         try:
-            ready = select.select([sock], [], [], timeout)
-            return bool(ready[0])
-        except select.error:
-            return False
+            # Try to decode as text
+            text = data.decode('utf-8', errors='replace')
+            
+            # Check if it's a valid ICAP response
+            lines = text.split('\r\n')
+            if not lines:
+                return result
+                
+            # Parse status line
+            status_line = lines[0]
+            if status_line.startswith('ICAP/1.0'):
+                parts = status_line.split(' ', 2)
+                if len(parts) >= 2:
+                    try:
+                        result["status_code"] = int(parts[1])
+                        result["status_text"] = parts[2] if len(parts) > 2 else ""
+                    except ValueError:
+                        pass
+            
+            # If not valid ICAP, try HTTP fallback
+            elif status_line.startswith('HTTP/1.'):
+                parts = status_line.split(' ', 2)
+                if len(parts) >= 2:
+                    try:
+                        result["status_code"] = int(parts[1])
+                        result["status_text"] = parts[2] if len(parts) > 2 else ""
+                    except ValueError:
+                        pass
+            
+            # Parse headers
+            headers = {}
+            for line in lines[1:]:
+                if not line or line.isspace():
+                    break
+                    
+                if ':' in line:
+                    key, value = line.split(':', 1)
+                    headers[key.strip()] = value.strip()
+            
+            result["headers"] = headers
+            
+            # Try to determine scan result
+            self._interpret_scan_result(result, text)
+            
+        except Exception as e:
+            self.log(f"Error parsing response: {str(e)}", "ERROR")
+            if self.debug:
+                # If text parsing failed, show hex dump
+                self.log("First 200 bytes of raw response:")
+                self.log(binascii.hexlify(data[:200]).decode('ascii'))
+                
+        return result
+    
+    def _interpret_scan_result(self, result: Dict[str, Any], text: str) -> None:
+        """
+        Try to interpret virus scan result from response.
+        
+        Args:
+            result: Result dictionary to update
+            text: Response text
+        """
+        # Common virus scan result headers
+        virus_headers = [
+            "X-Infection-Found", "X-Virus-ID", "X-Response-Info", 
+            "X-Virus-Name", "X-Virus-Found"
+        ]
+        
+        # Check headers
+        for header, value in result["headers"].items():
+            header_lower = header.lower()
+            for virus_header in virus_headers:
+                if virus_header.lower() in header_lower:
+                    if "true" in value.lower() or "yes" in value.lower() or "found" in value.lower():
+                        result["scan_result"] = "INFECTED"
+                    elif "false" in value.lower() or "no" in value.lower() or "not found" in value.lower():
+                        result["scan_result"] = "CLEAN"
+                    else:
+                        # If ambiguous but header exists, assume infected
+                        result["scan_result"] = "INFECTED"
+        
+        # Check status code
+        if result["status_code"]:
+            if result["status_code"] == 204:
+                result["scan_result"] = "CLEAN"  # No modifications needed
+            elif result["status_code"] == 200:
+                # Could be either clean or infected depending on headers
+                if result["scan_result"] == "UNKNOWN":
+                    # Look for common patterns
+                    text_lower = text.lower()
+                    if "virus" in text_lower or "malware" in text_lower or "infected" in text_lower:
+                        result["scan_result"] = "INFECTED"
+                    elif "clean" in text_lower or "no virus" in text_lower or "no infection" in text_lower:
+                        result["scan_result"] = "CLEAN"
 
 
 def parse_arguments():
@@ -232,10 +503,12 @@ def parse_arguments():
     parser.add_argument('--port', type=int, default=1344, help='ICAP server port (default: 1344)')
     parser.add_argument('--conn-timeout', type=int, default=300, 
                         help='Connection timeout in seconds (default: 300)')
-    parser.add_argument('--read-timeout', type=int, default=60,
-                        help='Read timeout in seconds (default: 60)')
+    parser.add_argument('--read-timeout', type=int, default=120,
+                        help='Read timeout in seconds (default: 120)')
     parser.add_argument('--service', default='virus_scan',
                         help='ICAP service path (default: virus_scan)')
+    parser.add_argument('--debug', action='store_true',
+                        help='Enable verbose debug output')
     return parser.parse_args()
 
 
@@ -249,34 +522,43 @@ def main():
         sys.exit(1)
     
     # Create client and scan file
-    client = IcapClient(args.server, args.port)
-    response = client.scan_file(args.filename, args.conn_timeout, args.read_timeout)
+    client = IcapClient(args.server, args.port, debug=args.debug)
+    result = client.scan_file(
+        args.filename, 
+        service_path=args.service,
+        timeout=args.conn_timeout,
+        read_timeout=args.read_timeout
+    )
     
-    if response:
-        print("\n---- ICAP Server Response ----")
-        print(response)
+    # Print results
+    print("\n---- ICAP Scan Results ----")
+    
+    if result["success"]:
+        print(f"Status: {result['status_code']} {result['status_text']}")
+        print(f"Scan Result: {result['scan_result']}")
         
-        # Extract status line for quick reference
-        status_line = response.split('\r\n')[0] if '\r\n' in response else response.split('\n')[0]
-        print("\n---- Scan Result Summary ----")
-        print(f"Status: {status_line}")
+        # Print important headers
+        print("\nImportant Headers:")
+        important_headers = ["X-Infection-Found", "X-Virus-ID", "X-Virus-Name", 
+                            "X-Response-Info", "X-Virus-Found"]
+        header_found = False
         
-        # Look for common virus scan result headers
-        result_headers = ["X-Infection-Found", "X-Virus-ID", "X-Response-Info", "X-Virus-Name"]
-        result_found = False
-        for line in response.split('\r\n'):
-            for header in result_headers:
-                if line.startswith(header):
-                    print(line)
-                    result_found = True
+        for header, value in result["headers"].items():
+            for important in important_headers:
+                if important.lower() in header.lower():
+                    print(f"{header}: {value}")
+                    header_found = True
         
-        if not result_found:
-            print("No explicit virus information found in headers.")
-            # Look for common result patterns in the response
-            if "not found" in response.lower() or "no virus" in response.lower():
-                print("Likely result: No threats detected")
-            elif "infected" in response.lower() or "virus" in response.lower():
-                print("Likely result: Threat detected")
+        if not header_found:
+            print("No virus-specific headers found")
+        
+        # Print full response in debug mode
+        if args.debug and result["raw_response"]:
+            print("\n---- Full Server Response ----")
+            print(result["raw_response"].decode('utf-8', errors='replace'))
+    else:
+        print(f"Scan Failed: {result['error']}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
